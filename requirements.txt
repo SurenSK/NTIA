@@ -1,0 +1,8 @@
+transformers
+scipy
+cryptography
+tqdm
+accelerate
+sentencepiece
+python-dotenv
+matplotlib
