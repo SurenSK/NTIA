@@ -167,8 +167,9 @@ def scoreRelationships(window_tokens):
             rep_past = repeat_cache(past, Rb)
             pos = torch.arange(T, device=model.device).unsqueeze(0) + past_len
             position_ids = pos.repeat(P * Rb, 1)
+            attn_mask2 = torch.ones((P * Rb, past_len + T), dtype=torch.long, device=model.device)
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = model(input_ids=labels_in_rep, past_key_values=rep_past, position_ids=position_ids, use_cache=False, return_dict=True)
+                out = model(input_ids=labels_in_rep, past_key_values=rep_past, position_ids=position_ids, attention_mask=attn_mask2, use_cache=False, return_dict=True)
             B, T2, V = out.logits.shape
             flat_loss = F.cross_entropy(out.logits.reshape(B * T2, V), labels_loss_rep.reshape(B * T2), reduction="none", ignore_index=-100)
             token_mask = (labels_loss_rep != -100).to(out.logits.dtype)
@@ -178,6 +179,7 @@ def scoreRelationships(window_tokens):
             for k, (si, oi) in enumerate(batch_pairs):
                 rel_scores[r0:r1, si, oi] = scores[:, k]
     return rel_scores.flatten().tolist()
+
 
 window_starts = list(range(0, len(tks) - windowSz, windowStride))
 for w in tqdm(window_starts[gpu_num::num_gpus]):
