@@ -99,20 +99,37 @@ def scoreRelationships(window_tokens):
         for i in range(0, len(all_messages_for_rel), batchSz):
             batch_messages = all_messages_for_rel[i:i + batchSz]
             batch_prompt_lens = user_prompt_token_lens[i:i + batchSz]
-            tokenized_batch = tokenizer.apply_chat_template(
-                batch_messages, 
-                add_generation_prompt=False, 
-                tokenize=True, 
-                padding=True, 
+            
+            # --- START DEFINITIVE PATCH ---
+            # 1. Use apply_chat_template to generate a list of final prompt strings.
+            formatted_prompts = [
+                tokenizer.apply_chat_template(m, add_generation_prompt=False, tokenize=False) 
+                for m in batch_messages
+            ]
+
+            # 2. Use the standard, robust tokenizer call on the list of strings.
+            # This will correctly return a BatchEncoding (dictionary-like) object.
+            tokenized_batch = tokenizer(
+                formatted_prompts,
+                padding=True,
+                truncation=True,
+                max_length=model.config.max_position_embeddings, # Use model's max length
                 return_tensors="pt"
             )
+
+            # 3. Create labels from the (now correctly structured) tokenized_batch.
             labels = tokenized_batch.input_ids.clone()
+
+            # 4. Manually move tensors to the target device.
             inputs = {k: v.to(model.device) for k, v in tokenized_batch.items()}
             labels = labels.to(model.device)
+
+            # 5. Mask labels using dictionary-key access.
             for j in range(len(batch_messages)):
                 labels[j, :batch_prompt_lens[j]] = -100
             
             labels[inputs['attention_mask'] == 0] = -100
+            # --- END DEFINITIVE PATCH ---
 
             with torch.no_grad():
                 logits = model(**inputs).logits
