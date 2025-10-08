@@ -106,7 +106,7 @@ def scoreRelationships(window_tokens):
         return len(ids) if isinstance(ids, list) else ids.shape[-1]
     user_prompt_token_lens = [prompt_len(p) for p in user_prompts_as_messages]
     relation_scores = []
-    for rel in relationships:
+    for rel in tqdm(relationships):
         all_messages_for_rel = [[{"role": "user", "content": user_content}, {"role": "assistant", "content": f" {rel}"}] for user_content in user_contents]
         scores_for_rel = []
         for i in range(0, len(all_messages_for_rel), batchSz):
@@ -135,12 +135,12 @@ def scoreRelationships(window_tokens):
         relation_scores.append(torch.tensor(scores_for_rel).view(len(objects), len(objects)))
     return torch.stack(relation_scores).flatten().tolist()
 
-all_window_scores = []
+# all_window_scores = []
 window_starts = list(range(0, len(tks) - windowSz, windowStride))
 for w in tqdm(window_starts[gpu_num::num_gpus]):
     selTks = tks[w : w + windowSz]
     scores = scoreRelationships(selTks)
-    all_window_scores.append(torch.tensor(scores).view(len(relationships), len(objects), len(objects)))
-
-res = torch.stack(all_window_scores)
-torch.save(res, f"res_gpu_{gpu_num}.pt")
+    torch.save(torch.tensor(scores).view(len(relationships), len(objects), len(objects)), f'res_{w}.pt')
+    
+# res = torch.stack(all_window_scores)
+# torch.save(res, f"res_gpu_{gpu_num}.pt")
