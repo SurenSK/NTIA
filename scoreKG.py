@@ -99,12 +99,20 @@ def scoreRelationships(window_tokens):
         for i in range(0, len(all_messages_for_rel), batchSz):
             batch_messages = all_messages_for_rel[i:i + batchSz]
             batch_prompt_lens = user_prompt_token_lens[i:i + batchSz]
-            inputs = tokenizer.apply_chat_template(batch_messages, add_generation_prompt=False, tokenize=True, padding=True, return_tensors="pt").to(model.device)
-            labels = inputs.input_ids.clone()
-            
+            tokenized_batch = tokenizer.apply_chat_template(
+                batch_messages, 
+                add_generation_prompt=False, 
+                tokenize=True, 
+                padding=True, 
+                return_tensors="pt"
+            )
+            labels = tokenized_batch.input_ids.clone()
+            inputs = {k: v.to(model.device) for k, v in tokenized_batch.items()}
+            labels = labels.to(model.device)
             for j in range(len(batch_messages)):
                 labels[j, :batch_prompt_lens[j]] = -100
-            labels[inputs.attention_mask == 0] = -100
+            
+            labels[inputs['attention_mask'] == 0] = -100
 
             with torch.no_grad():
                 logits = model(**inputs).logits
@@ -114,10 +122,10 @@ def scoreRelationships(window_tokens):
             completion_tokens = (labels != -100).sum(dim=1).clamp(min=1)
             seq_log_probs = log_probs.sum(dim=1) / completion_tokens
             scores_for_rel.extend(seq_log_probs.cpu().tolist())
+            
         relation_scores.append(torch.tensor(scores_for_rel).view(len(objects), len(objects)))
     
     return torch.stack(relation_scores).flatten().tolist()
-
 all_window_scores = []
 window_starts = list(range(0, len(tks) - windowSz, windowStride))
 for w in tqdm(window_starts[gpu_num::num_gpus]):
