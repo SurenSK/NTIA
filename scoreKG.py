@@ -22,7 +22,7 @@ model.eval()
 
 windowSz = 3072
 windowStride = windowSz // 2
-pairBatchSz = 16
+pairBatchSz = 4
 batchSz = pairBatchSz
 negativeRelationship = False
 
