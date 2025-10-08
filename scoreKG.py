@@ -4,12 +4,24 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
 gpu_num = int(sys.argv[1])
 num_gpus = int(sys.argv[2])
+
 tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")
-model = AutoModelForCausalLM.from_pretrained("openai/gpt-oss-20b", torch_dtype=torch.float16, device_map='auto')
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.truncation_side = "left"
+
+model = AutoModelForCausalLM.from_pretrained(
+    "openai/gpt-oss-20b",
+    dtype=torch.bfloat16,
+    device_map="auto",
+)
+model.eval()
+
 windowSz = 3072
-windowStride = windowSz//2
+windowStride = windowSz // 2
 batchSz = 4
 negativeRelationship = False
 
@@ -68,7 +80,7 @@ objects = [
     "Channel: PUSCH",
     "Channel: PDCCH",
     "Channel: PUCCH",
-    "Channel: PBCH", 
+    "Channel: PBCH",
     "Channel: PRACH",
     "Signal: DMRS",
     "Signal: SRS",
@@ -80,60 +92,55 @@ objects = [
     "Function: Network Energy Savings (NES)",
     "Procedure: UE Registration",
     "Procedure: RACH",
-    "Procedure: PDU Session Establishment"
+    "Procedure: PDU Session Establishment",
 ]
-# check incose
-# check attn > naive, low entropy
-relationships = ['HAS_NO_RELATION_TO', 'HAS_PART', 'PERFORMS', 'DEPENDS_ON', 'SENDS', 'CONFIGURES', 'IMPLEMENTS', 'CONSTRAINED_BY']
+
+relationships = ["HAS_NO_RELATION_TO", "HAS_PART", "PERFORMS", "DEPENDS_ON", "SENDS", "CONFIGURES", "IMPLEMENTS", "CONSTRAINED_BY"]
 
 def scoreRelationships(window_tokens):
     window_text = tokenizer.decode(window_tokens, skip_special_tokens=True)
-    user_contents = [f"Based on the text provided, identify the relationship between the subject and object.\n\nText: \"{window_text}\"\n\nSubject: {s}\nObject: {o}\nRelationship:" for s in objects for o in objects]
+    user_contents = [f'Based on the text provided, identify the relationship between the subject and object.\n\nText: "{window_text}"\n\nSubject: {s}\nObject: {o}\nRelationship:' for s in objects for o in objects]
     user_prompts_as_messages = [[{"role": "user", "content": c}] for c in user_contents]
-    user_prompt_token_lens = [len(tokenizer.apply_chat_template(p, add_generation_prompt=True, tokenize=True)) for p in user_prompts_as_messages]
-    
+    def prompt_len(msg):
+        ids = tokenizer.apply_chat_template(msg, add_generation_prompt=True, tokenize=True)
+        return len(ids) if isinstance(ids, list) else ids.shape[-1]
+    user_prompt_token_lens = [prompt_len(p) for p in user_prompts_as_messages]
     relation_scores = []
     for rel in relationships:
         all_messages_for_rel = [[{"role": "user", "content": user_content}, {"role": "assistant", "content": f" {rel}"}] for user_content in user_contents]
         scores_for_rel = []
         for i in range(0, len(all_messages_for_rel), batchSz):
-            batch_messages = all_messages_for_rel[i:i + batchSz]
-            batch_prompt_lens = user_prompt_token_lens[i:i + batchSz]
-            formatted_prompts = [
-                tokenizer.apply_chat_template(m, add_generation_prompt=False, tokenize=False) 
-                for m in batch_messages
-            ]
-            tokenized_batch = tokenizer(
-                formatted_prompts,
+            batch_messages = all_messages_for_rel[i : i + batchSz]
+            batch_prompt_lens = user_prompt_token_lens[i : i + batchSz]
+            rendered = [tokenizer.apply_chat_template(m, add_generation_prompt=False, tokenize=False) for m in batch_messages]
+            enc = tokenizer(
+                rendered,
                 padding=True,
                 truncation=True,
-                max_length=model.config.max_position_embeddings, # Use model's max length
-                return_tensors="pt"
+                max_length=model.config.max_position_embeddings,
+                return_tensors="pt",
             )
-            labels = tokenized_batch.input_ids.clone()
-            inputs = {k: v.to(model.device) for k, v in tokenized_batch.items()}
-            labels = labels.to(model.device)
+            inputs = {k: v.to(model.device) for k, v in enc.items()}
+            labels = inputs["input_ids"].clone()
             for j in range(len(batch_messages)):
-                labels[j, :batch_prompt_lens[j]] = -100
-            labels[inputs['attention_mask'] == 0] = -100
-            with torch.no_grad():
+                labels[j, : batch_prompt_lens[j]] = -100
+            labels[inputs["attention_mask"] == 0] = -100
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = model(**inputs).logits
-            
             B, S, V = logits.shape
-            log_probs = -F.cross_entropy(logits.view(B * S, V), labels.view(B * S), reduction='none', ignore_index=-100).view(B, S)
+            log_probs = -F.cross_entropy(logits.view(B * S, V), labels.view(B * S), reduction="none", ignore_index=-100).view(B, S)
             completion_tokens = (labels != -100).sum(dim=1).clamp(min=1)
             seq_log_probs = log_probs.sum(dim=1) / completion_tokens
-            scores_for_rel.extend(seq_log_probs.cpu().tolist())
-            
+            scores_for_rel.extend(seq_log_probs.detach().cpu().tolist())
         relation_scores.append(torch.tensor(scores_for_rel).view(len(objects), len(objects)))
-    
     return torch.stack(relation_scores).flatten().tolist()
+
 all_window_scores = []
 window_starts = list(range(0, len(tks) - windowSz, windowStride))
 for w in tqdm(window_starts[gpu_num::num_gpus]):
-    selTks = tks[w:w + windowSz]
+    selTks = tks[w : w + windowSz]
     scores = scoreRelationships(selTks)
     all_window_scores.append(torch.tensor(scores).view(len(relationships), len(objects), len(objects)))
 
-res = torch.stack(all_window_scores).rename('window', 'relationship', 'source', 'dest')
+res = torch.stack(all_window_scores)
 torch.save(res, f"res_gpu_{gpu_num}.pt")
