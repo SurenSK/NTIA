@@ -4,10 +4,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
-try:
-    from transformers.cache_utils import DynamicCache
-except Exception:
-    DynamicCache = None
+from transformers.cache_utils import DynamicCache
 
 gpu_num = int(sys.argv[1])
 num_gpus = int(sys.argv[2])
@@ -16,6 +13,7 @@ tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.truncation_side = "left"
+tokenizer.padding_side = "right"
 
 model = AutoModelForCausalLM.from_pretrained(
     "openai/gpt-oss-20b",
@@ -136,17 +134,12 @@ def pad_batch(seqs, pad_id):
         mask[i, :L] = 1
     return out, mask
 
-def repeat_cache(past, repeat_factor):
-    try:
-        legacy = past.to_legacy_cache()
-        rep_legacy = []
-        for layer in legacy:
-            rep_legacy.append(tuple(x.repeat_interleave(repeat_factor, dim=0) for x in layer))
-        if DynamicCache is None:
-            return rep_legacy
-        return DynamicCache.from_legacy_cache(rep_legacy)
-    except AttributeError:
-        return tuple(tuple(x.repeat_interleave(repeat_factor, dim=0) for x in layer) for layer in past)
+def repeat_cache(past: DynamicCache, repeat_factor: int) -> DynamicCache:
+    legacy = past.to_legacy_cache()
+    rep_legacy = []
+    for layer in legacy:
+        rep_legacy.append(tuple(x.repeat_interleave(repeat_factor, dim=0) for x in layer))
+    return DynamicCache.from_legacy_cache(rep_legacy)
 
 def scoreRelationships(window_tokens):
     max_ctx = getattr(model.config, "max_position_embeddings", 4096)
@@ -162,7 +155,8 @@ def scoreRelationships(window_tokens):
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             base_out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=True, return_dict=True)
         past = base_out.past_key_values
-        P, M = attn_mask.shape
+        P = input_ids.size(0)
+        past_len = past.get_seq_length()
         for r0 in range(0, len(relationships), relsChunkSz):
             r1 = min(r0 + relsChunkSz, len(relationships))
             labels_in = labels_padded[r0:r1].to(model.device)
@@ -171,16 +165,15 @@ def scoreRelationships(window_tokens):
             labels_in_rep = labels_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, T)
             labels_loss_rep = labels_loss_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, T)
             rep_past = repeat_cache(past, Rb)
-            base_mask_rep = attn_mask.repeat_interleave(Rb, dim=0)
-            label_mask = (labels_in_rep != tokenizer.pad_token_id).long()
-            concat_mask = torch.cat([base_mask_rep, label_mask], dim=1)
+            pos = torch.arange(T, device=model.device).unsqueeze(0) + past_len
+            position_ids = pos.repeat(P * Rb, 1)
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = model(input_ids=labels_in_rep, past_key_values=rep_past, attention_mask=concat_mask, return_dict=True)
-            B, T, V = out.logits.shape
-            flat_loss = F.cross_entropy(out.logits.reshape(B * T, V), labels_loss_rep.reshape(B * T), reduction="none", ignore_index=-100)
+                out = model(input_ids=labels_in_rep, past_key_values=rep_past, position_ids=position_ids, use_cache=False, return_dict=True)
+            B, T2, V = out.logits.shape
+            flat_loss = F.cross_entropy(out.logits.reshape(B * T2, V), labels_loss_rep.reshape(B * T2), reduction="none", ignore_index=-100)
             token_mask = (labels_loss_rep != -100).to(out.logits.dtype)
             token_counts = token_mask.sum(dim=1).clamp(min=1)
-            seq_log_probs = (-flat_loss.view(B, T) * token_mask).sum(dim=1) / token_counts
+            seq_log_probs = (-flat_loss.view(B, T2) * token_mask).sum(dim=1) / token_counts
             scores = seq_log_probs.view(P, Rb).transpose(0, 1).detach().cpu()
             for k, (si, oi) in enumerate(batch_pairs):
                 rel_scores[r0:r1, si, oi] = scores[:, k]
