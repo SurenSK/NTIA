@@ -4,6 +4,10 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
+try:
+    from transformers.cache_utils import DynamicCache
+except Exception:
+    DynamicCache = None
 
 gpu_num = int(sys.argv[1])
 num_gpus = int(sys.argv[2])
@@ -19,11 +23,12 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
 )
 model.eval()
+torch.set_grad_enabled(False)
 
 windowSz = 3072
 windowStride = windowSz // 2
 pairBatchSz = 4
-batchSz = pairBatchSz
+relsChunkSz = 4
 negativeRelationship = False
 
 FILE_PATH = "spec_nodes.md"
@@ -110,6 +115,8 @@ for i, seq in enumerate(label_ids_list):
     L = len(seq)
     labels_padded[i, :L] = torch.tensor(seq, dtype=torch.long)
     labels_loss[i, :L] = torch.tensor(seq, dtype=torch.long)
+labels_padded = labels_padded
+labels_loss = labels_loss
 
 def left_truncate(ids, maxlen):
     if len(ids) <= maxlen:
@@ -132,20 +139,17 @@ def pad_batch(seqs, pad_id):
         mask[i, :L] = 1
     return out, mask
 
-def repeat_past_kv(past, repeat_factor):
-    new_past = []
-    for layer in past:
-        if isinstance(layer, tuple):
-            new_layer = []
-            for x in layer:
-                if torch.is_tensor(x):
-                    new_layer.append(x.repeat_interleave(repeat_factor, dim=0))
-                else:
-                    new_layer.append(x)
-            new_past.append(tuple(new_layer))
-        else:
-            new_past.append(layer)
-    return tuple(new_past)
+def repeat_cache(past, repeat_factor):
+    try:
+        legacy = past.to_legacy_cache()
+        rep_legacy = []
+        for layer in legacy:
+            rep_legacy.append(tuple(x.repeat_interleave(repeat_factor, dim=0) for x in layer))
+        if DynamicCache is None:
+            return rep_legacy
+        return DynamicCache.from_legacy_cache(rep_legacy)
+    except AttributeError:
+        return tuple(tuple(x.repeat_interleave(repeat_factor, dim=0) for x in layer) for layer in past)
 
 def scoreRelationships(window_tokens):
     max_ctx = getattr(model.config, "max_position_embeddings", 4096)
@@ -162,21 +166,24 @@ def scoreRelationships(window_tokens):
             base_out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=True, return_dict=True)
         past = base_out.past_key_values
         P = input_ids.size(0)
-        labels_in = labels_padded.to(model.device)
-        labels_loss_in = labels_loss.to(model.device)
-        labels_in_rep = labels_in.unsqueeze(0).repeat(P, 1, 1).view(P * len(relationships), -1)
-        labels_loss_rep = labels_loss_in.unsqueeze(0).repeat(P, 1, 1).view(P * len(relationships), -1)
-        rep_past = repeat_past_kv(past, len(relationships))
-        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(input_ids=labels_in_rep, past_key_values=rep_past, return_dict=True)
-        B, T, V = out.logits.shape
-        flat_loss = F.cross_entropy(out.logits.view(B * T, V), labels_loss_rep.view(B * T), reduction="none", ignore_index=-100)
-        token_mask = (labels_loss_rep != -100).to(out.logits.dtype)
-        token_counts = token_mask.sum(dim=1).clamp(min=1)
-        seq_log_probs = (-flat_loss.view(B, T) * token_mask).sum(dim=1) / token_counts
-        scores = seq_log_probs.view(P, len(relationships)).transpose(0, 1).detach().cpu()
-        for k, (si, oi) in enumerate(batch_pairs):
-            rel_scores[:, si, oi] = scores[:, k]
+        for r0 in range(0, len(relationships), relsChunkSz):
+            r1 = min(r0 + relsChunkSz, len(relationships))
+            labels_in = labels_padded[r0:r1].to(model.device)
+            labels_loss_in = labels_loss[r0:r1].to(model.device)
+            Rb = labels_in.size(0)
+            labels_in_rep = labels_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, -1)
+            labels_loss_rep = labels_loss_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, -1)
+            rep_past = repeat_cache(past, Rb)
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = model(input_ids=labels_in_rep, past_key_values=rep_past, return_dict=True)
+            B, T, V = out.logits.shape
+            flat_loss = F.cross_entropy(out.logits.view(B * T, V), labels_loss_rep.view(B * T), reduction="none", ignore_index=-100)
+            token_mask = (labels_loss_rep != -100).to(out.logits.dtype)
+            token_counts = token_mask.sum(dim=1).clamp(min=1)
+            seq_log_probs = (-flat_loss.view(B, T) * token_mask).sum(dim=1) / token_counts
+            scores = seq_log_probs.view(P, Rb).transpose(0, 1).detach().cpu()
+            for k, (si, oi) in enumerate(batch_pairs):
+                rel_scores[r0:r1, si, oi] = scores[:, k]
     return rel_scores.flatten().tolist()
 
 window_starts = list(range(0, len(tks) - windowSz, windowStride))
