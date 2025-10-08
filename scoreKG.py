@@ -5,8 +5,8 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 gpu_num = int(sys.argv[1])
 num_gpus = int(sys.argv[2])
-tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b")
-model = AutoModelForCausalLM.from_pretrained("google/gemma-2b", torch_dtype=torch.float16, device_map='auto')
+tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")
+model = AutoModelForCausalLM.from_pretrained("openai/gpt-oss-20b", torch_dtype=torch.float16, device_map='auto')
 windowSz = 5000
 windowStride = windowSz//2
 batchSz = 16
@@ -87,28 +87,29 @@ relationships = ['HAS_NO_RELATION_TO', 'HAS_PART', 'PERFORMS', 'DEPENDS_ON', 'SE
 
 def scoreRelationships(window_tokens):
     window_text = tokenizer.decode(window_tokens, skip_special_tokens=True)
-    so_prompts = [f"Based on the text provided, identify the relationship between the subject and object.\n\nText: \"{window_text}\"\n\nSubject: {s}\nObject: {o}\nRelationship:" for s in objects for o in objects]
-    prompt_lens = [len(tokenizer.encode(p, add_special_tokens=False)) for p in so_prompts]
+    user_contents = [f"Based on the text provided, identify the relationship between the subject and object.\n\nText: \"{window_text}\"\n\nSubject: {s}\nObject: {o}\nRelationship:" for s in objects for o in objects]
+    user_prompts_as_messages = [[{"role": "user", "content": c}] for c in user_contents]
+    user_prompt_token_lens = [len(tokenizer.apply_chat_template(p, add_generation_prompt=True, tokenize=True)) for p in user_prompts_as_messages]
     
     relation_scores = []
     for rel in relationships:
-        full_texts = [p + " " + rel for p in so_prompts]
+        all_messages_for_rel = [[{"role": "user", "content": user_content}, {"role": "assistant", "content": f" {rel}"}] for user_content in user_contents]
         scores_for_rel = []
-        for i in range(0, len(full_texts), batchSz):
-            batch_texts = full_texts[i:i + batchSz]
-            batch_prompt_lens = prompt_lens[i:i + batchSz]
-            inputs = tokenizer(batch_texts, padding=True, return_tensors="pt", add_special_tokens=False)
+        for i in range(0, len(all_messages_for_rel), batchSz):
+            batch_messages = all_messages_for_rel[i:i + batchSz]
+            batch_prompt_lens = user_prompt_token_lens[i:i + batchSz]
+            inputs = tokenizer.apply_chat_template(batch_messages, add_generation_prompt=False, tokenize=True, padding=True, return_tensors="pt").to(model.device)
             labels = inputs.input_ids.clone()
             
-            for j in range(len(batch_texts)):
+            for j in range(len(batch_messages)):
                 labels[j, :batch_prompt_lens[j]] = -100
+            labels[inputs.attention_mask == 0] = -100
 
             with torch.no_grad():
                 logits = model(**inputs).logits
-            labels = labels.to(logits.device)
-
+            
             B, S, V = logits.shape
-            log_probs = -F.cross_entropy(logits.view(B * S, V), labels.view(B * S), reduction='none').view(B, S)
+            log_probs = -F.cross_entropy(logits.view(B * S, V), labels.view(B * S), reduction='none', ignore_index=-100).view(B, S)
             completion_tokens = (labels != -100).sum(dim=1).clamp(min=1)
             seq_log_probs = log_probs.sum(dim=1) / completion_tokens
             scores_for_rel.extend(seq_log_probs.cpu().tolist())
