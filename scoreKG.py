@@ -8,9 +8,9 @@ gpu_num = int(sys.argv[1])
 num_gpus = int(sys.argv[2])
 tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")
 model = AutoModelForCausalLM.from_pretrained("openai/gpt-oss-20b", torch_dtype=torch.float16, device_map='auto')
-windowSz = 5000
+windowSz = 3072
 windowStride = windowSz//2
-batchSz = 16
+batchSz = 4
 negativeRelationship = False
 
 FILE_PATH = "spec_nodes.md"
@@ -99,16 +99,10 @@ def scoreRelationships(window_tokens):
         for i in range(0, len(all_messages_for_rel), batchSz):
             batch_messages = all_messages_for_rel[i:i + batchSz]
             batch_prompt_lens = user_prompt_token_lens[i:i + batchSz]
-            
-            # --- START DEFINITIVE PATCH ---
-            # 1. Use apply_chat_template to generate a list of final prompt strings.
             formatted_prompts = [
                 tokenizer.apply_chat_template(m, add_generation_prompt=False, tokenize=False) 
                 for m in batch_messages
             ]
-
-            # 2. Use the standard, robust tokenizer call on the list of strings.
-            # This will correctly return a BatchEncoding (dictionary-like) object.
             tokenized_batch = tokenizer(
                 formatted_prompts,
                 padding=True,
@@ -116,21 +110,12 @@ def scoreRelationships(window_tokens):
                 max_length=model.config.max_position_embeddings, # Use model's max length
                 return_tensors="pt"
             )
-
-            # 3. Create labels from the (now correctly structured) tokenized_batch.
             labels = tokenized_batch.input_ids.clone()
-
-            # 4. Manually move tensors to the target device.
             inputs = {k: v.to(model.device) for k, v in tokenized_batch.items()}
             labels = labels.to(model.device)
-
-            # 5. Mask labels using dictionary-key access.
             for j in range(len(batch_messages)):
                 labels[j, :batch_prompt_lens[j]] = -100
-            
             labels[inputs['attention_mask'] == 0] = -100
-            # --- END DEFINITIVE PATCH ---
-
             with torch.no_grad():
                 logits = model(**inputs).logits
             
