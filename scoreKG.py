@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 gpu_num = int(sys.argv[1])
 num_gpus = int(sys.argv[2])
@@ -119,7 +120,7 @@ def scoreRelationships(window_tokens):
 
 all_window_scores = []
 window_starts = list(range(0, len(tks) - windowSz, windowStride))
-for w in window_starts[gpu_num::num_gpus]:
+for w in tqdm(window_starts[gpu_num::num_gpus]):
     selTks = tks[w:w + windowSz]
     scores = scoreRelationships(selTks)
     all_window_scores.append(torch.tensor(scores).view(len(relationships), len(objects), len(objects)))
