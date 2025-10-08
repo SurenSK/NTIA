@@ -141,6 +141,8 @@ def repeat_cache(past: DynamicCache, repeat_factor: int) -> DynamicCache:
         rep_legacy.append(tuple(x.repeat_interleave(repeat_factor, dim=0) for x in layer))
     return DynamicCache.from_legacy_cache(rep_legacy)
 
+import inspect
+
 def scoreRelationships(window_tokens):
     max_ctx = getattr(model.config, "max_position_embeddings", 4096)
     pairs = [(si, oi) for si in range(len(objects)) for oi in range(len(objects))]
@@ -165,11 +167,17 @@ def scoreRelationships(window_tokens):
             labels_in_rep = labels_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, T)
             labels_loss_rep = labels_loss_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, T)
             rep_past = repeat_cache(past, Rb)
-            pos = torch.arange(T, device=model.device).unsqueeze(0) + past_len
-            position_ids = pos.repeat(P * Rb, 1)
-            attn_mask2 = torch.ones((P * Rb, past_len + T), dtype=torch.long, device=model.device)
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = model(input_ids=labels_in_rep, past_key_values=rep_past, position_ids=position_ids, attention_mask=attn_mask2, use_cache=False, return_dict=True)
+            base_attn_rep = attn_mask.repeat_interleave(Rb, dim=0)
+            label_ones = torch.ones((P * Rb, T), dtype=attn_mask.dtype, device=attn_mask.device)
+            attn_mask_full = torch.cat([base_attn_rep, label_ones], dim=1)
+            if "cache_position" in inspect.signature(model.forward).parameters:
+                cache_position = torch.arange(past_len, past_len + T, device=model.device).unsqueeze(0).repeat(P * Rb, 1)
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    out = model(input_ids=labels_in_rep, past_key_values=rep_past, attention_mask=attn_mask_full, cache_position=cache_position, use_cache=False, return_dict=True)
+            else:
+                position_ids = (torch.arange(T, device=model.device).unsqueeze(0) + past_len).repeat(P * Rb, 1)
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    out = model(input_ids=labels_in_rep, past_key_values=rep_past, attention_mask=attn_mask_full, position_ids=position_ids, use_cache=False, return_dict=True)
             B, T2, V = out.logits.shape
             flat_loss = F.cross_entropy(out.logits.reshape(B * T2, V), labels_loss_rep.reshape(B * T2), reduction="none", ignore_index=-100)
             token_mask = (labels_loss_rep != -100).to(out.logits.dtype)
