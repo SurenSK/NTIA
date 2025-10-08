@@ -29,7 +29,6 @@ windowSz = 3072
 windowStride = windowSz // 2
 pairBatchSz = 4
 relsChunkSz = 4
-negativeRelationship = False
 
 FILE_PATH = "spec_nodes.md"
 with open(FILE_PATH, "r", encoding="utf-8") as f:
@@ -115,8 +114,6 @@ for i, seq in enumerate(label_ids_list):
     L = len(seq)
     labels_padded[i, :L] = torch.tensor(seq, dtype=torch.long)
     labels_loss[i, :L] = torch.tensor(seq, dtype=torch.long)
-labels_padded = labels_padded
-labels_loss = labels_loss
 
 def left_truncate(ids, maxlen):
     if len(ids) <= maxlen:
@@ -165,19 +162,22 @@ def scoreRelationships(window_tokens):
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             base_out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=True, return_dict=True)
         past = base_out.past_key_values
-        P = input_ids.size(0)
+        P, M = attn_mask.shape
         for r0 in range(0, len(relationships), relsChunkSz):
             r1 = min(r0 + relsChunkSz, len(relationships))
             labels_in = labels_padded[r0:r1].to(model.device)
             labels_loss_in = labels_loss[r0:r1].to(model.device)
-            Rb = labels_in.size(0)
-            labels_in_rep = labels_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, -1)
-            labels_loss_rep = labels_loss_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, -1)
+            Rb, T = labels_in.shape
+            labels_in_rep = labels_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, T)
+            labels_loss_rep = labels_loss_in.unsqueeze(0).repeat(P, 1, 1).view(P * Rb, T)
             rep_past = repeat_cache(past, Rb)
+            base_mask_rep = attn_mask.repeat_interleave(Rb, dim=0)
+            label_mask = (labels_in_rep != tokenizer.pad_token_id).long()
+            concat_mask = torch.cat([base_mask_rep, label_mask], dim=1)
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = model(input_ids=labels_in_rep, past_key_values=rep_past, return_dict=True)
+                out = model(input_ids=labels_in_rep, past_key_values=rep_past, attention_mask=concat_mask, return_dict=True)
             B, T, V = out.logits.shape
-            flat_loss = F.cross_entropy(out.logits.view(B * T, V), labels_loss_rep.view(B * T), reduction="none", ignore_index=-100)
+            flat_loss = F.cross_entropy(out.logits.reshape(B * T, V), labels_loss_rep.reshape(B * T), reduction="none", ignore_index=-100)
             token_mask = (labels_loss_rep != -100).to(out.logits.dtype)
             token_counts = token_mask.sum(dim=1).clamp(min=1)
             seq_log_probs = (-flat_loss.view(B, T) * token_mask).sum(dim=1) / token_counts
