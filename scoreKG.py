@@ -1,11 +1,7 @@
 import os
-import re
 import sys
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
 import torch.nn.functional as F
-from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM
 gpu_num = int(sys.argv[1])
 num_gpus = int(sys.argv[2])
@@ -101,7 +97,7 @@ def scoreRelationships(window_tokens):
         for i in range(0, len(full_texts), batchSz):
             batch_texts = full_texts[i:i + batchSz]
             batch_prompt_lens = prompt_lens[i:i + batchSz]
-            inputs = tokenizer(batch_texts, padding=True, return_tensors="pt", add_special_tokens=False).to(DEVICE)
+            inputs = tokenizer(batch_texts, padding=True, return_tensors="pt", add_special_tokens=False)
             labels = inputs.input_ids.clone()
             
             for j in range(len(batch_texts)):
@@ -109,7 +105,8 @@ def scoreRelationships(window_tokens):
 
             with torch.no_grad():
                 logits = model(**inputs).logits
-            
+            labels = labels.to(logits.device)
+
             B, S, V = logits.shape
             log_probs = -F.cross_entropy(logits.view(B * S, V), labels.view(B * S), reduction='none').view(B, S)
             completion_tokens = (labels != -100).sum(dim=1).clamp(min=1)
