@@ -150,6 +150,12 @@ import torch.nn.functional as F
 from transformers import StaticCache
 from tqdm import tqdm
 
+import copy
+import torch
+import torch.nn.functional as F
+from transformers import StaticCache
+from tqdm import tqdm
+
 def scoreRelationships(window_tokens):
     # This function assumes the following variables are defined in the global scope:
     # tokenizer, model, template_parts, so_token_map, rel_token_map,
@@ -179,13 +185,11 @@ def scoreRelationships(window_tokens):
             batch_so = so_pairs[i:i+batchSz]
             current_batch_size = len(batch_so)
             
-            expanded_cache_layers = []
-            for layer_cache in base_cache:
-                key, value = layer_cache
-                expanded_key = key.expand(current_batch_size, -1, -1, -1)
-                expanded_value = value.expand(current_batch_size, -1, -1, -1)
-                expanded_cache_layers.append((expanded_key, expanded_value))
-            expanded_cache = tuple(expanded_cache_layers)
+            cache_for_batch = copy.deepcopy(base_cache)
+            for layer_idx in range(len(base_cache.layers)):
+                key, value = base_cache.layers[layer_idx].keys, base_cache.layers[layer_idx].values
+                cache_for_batch.layers[layer_idx].keys = key.expand(current_batch_size, -1, -1, -1)
+                cache_for_batch.layers[layer_idx].values = value.expand(current_batch_size, -1, -1, -1)
 
             batch_input_ids = []
             batch_labels = []
@@ -217,7 +221,7 @@ def scoreRelationships(window_tokens):
             inputs = {'input_ids': padded_input_ids, 'attention_mask': full_attention_mask}
             
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(**inputs, past_key_values=expanded_cache, use_cache=False).logits
+                logits = model(**inputs, past_key_values=cache_for_batch, use_cache=False).logits
             
             B, S, V = logits.shape
             log_probs = -F.cross_entropy(logits.view(B*S, V), padded_labels.view(B*S), reduction="none", ignore_index=-100).view(B, S)
@@ -228,7 +232,6 @@ def scoreRelationships(window_tokens):
         relation_scores.append(torch.tensor(scores_for_rel).view(len(objects), len(objects)))
         
     return torch.stack(relation_scores).flatten().tolist()
-
 # all_window_scores = []
 window_starts = list(range(0, len(tks) - windowSz, windowStride))
 for w in tqdm(window_starts[gpu_num::num_gpus]):
