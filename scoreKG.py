@@ -17,6 +17,7 @@ model = AutoModelForCausalLM.from_pretrained(
     "openai/gpt-oss-20b",
     dtype=torch.bfloat16,
     device_map="auto",
+    attn_implementation="flash_attention_2"
 )
 model.eval()
 
