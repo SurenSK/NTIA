@@ -188,8 +188,10 @@ def scoreRelationships(window_tokens):
             cache_for_batch = copy.deepcopy(base_cache)
             for layer_idx in range(len(base_cache.layers)):
                 key, value = base_cache.layers[layer_idx].keys, base_cache.layers[layer_idx].values
-                cache_for_batch.layers[layer_idx].keys = key.expand(current_batch_size, -1, -1, -1)
-                cache_for_batch.layers[layer_idx].values = value.expand(current_batch_size, -1, -1, -1)
+                
+                # Add .clone() to create a contiguous tensor with its own memory
+                cache_for_batch.layers[layer_idx].keys = key.expand(current_batch_size, -1, -1, -1).clone()
+                cache_for_batch.layers[layer_idx].values = value.expand(current_batch_size, -1, -1, -1).clone()
 
             batch_input_ids = []
             batch_labels = []
