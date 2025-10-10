@@ -144,10 +144,16 @@ import torch.nn.functional as F
 from transformers import StaticCache
 from tqdm import tqdm
 
+import copy
+import torch
+import torch.nn.functional as F
+from transformers import StaticCache
+from tqdm import tqdm
+
 def scoreRelationships(window_tokens):
     # This function assumes the following variables are defined in the global scope:
     # tokenizer, model, template_parts, so_token_map, rel_token_map,
-    # relationships, so_pairs, batchSz
+    # relationships, so_pairs, batchSz, objects
 
     window_text = tokenizer.decode(window_tokens, skip_special_tokens=True)
     shared_prefix = f'Based on the text provided, identify the relationship between the subject and object.\n\nText: "{window_text}"\n\n'
@@ -171,7 +177,16 @@ def scoreRelationships(window_tokens):
         
         for i in range(0, len(so_pairs), batchSz):
             batch_so = so_pairs[i:i+batchSz]
+            current_batch_size = len(batch_so)
             
+            expanded_cache_layers = []
+            for layer_cache in base_cache:
+                key, value = layer_cache
+                expanded_key = key.expand(current_batch_size, -1, -1, -1)
+                expanded_value = value.expand(current_batch_size, -1, -1, -1)
+                expanded_cache_layers.append((expanded_key, expanded_value))
+            expanded_cache = tuple(expanded_cache_layers)
+
             batch_input_ids = []
             batch_labels = []
             for s, o in batch_so:
@@ -201,9 +216,8 @@ def scoreRelationships(window_tokens):
             )
             inputs = {'input_ids': padded_input_ids, 'attention_mask': full_attention_mask}
             
-            cache_copy = copy.deepcopy(base_cache)
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(**inputs, past_key_values=cache_copy).logits
+                logits = model(**inputs, past_key_values=expanded_cache, use_cache=False).logits
             
             B, S, V = logits.shape
             log_probs = -F.cross_entropy(logits.view(B*S, V), padded_labels.view(B*S), reduction="none", ignore_index=-100).view(B, S)
